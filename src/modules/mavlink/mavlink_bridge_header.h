@@ -94,6 +94,10 @@ extern mavlink_message_t *mavlink_get_channel_buffer(uint8_t chan);
 
 #include <mavlink.h>
 
+#if CONFIG_DRIVERS_TRANSPONDER_UAVIONIX
+#include <uAvionix.h>
+#endif
+
 __END_DECLS
 
 #endif /* MAVLINK_BRIDGE_HEADER_H */

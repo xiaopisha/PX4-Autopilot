@@ -35,8 +35,12 @@
 #define ADSB_VEHICLE_HPP
 
 #include <uORB/topics/transponder_report.h>
+#include <uORB/topics/sensor_gps.h>
+#include <uORB/topics/vehicle_air_data.h>
+#include <uORB/topics/vehicle_status.h>
+#include <uORB/topics/parameter_update.h>
 
-class MavlinkStreamADSBVehicle : public MavlinkStream
+class MavlinkStreamADSBVehicle : public ModuleParams, public MavlinkStream
 {
 public:
 	static MavlinkStream *new_instance(Mavlink *mavlink) { return new MavlinkStreamADSBVehicle(mavlink); }
@@ -55,9 +59,30 @@ public:
 	}
 
 private:
-	explicit MavlinkStreamADSBVehicle(Mavlink *mavlink) : MavlinkStream(mavlink) {}
+	explicit MavlinkStreamADSBVehicle(Mavlink *mavlink) : ModuleParams(nullptr), MavlinkStream(mavlink) {}
 
 	uORB::Subscription _transponder_report_sub{ORB_ID(transponder_report)};
+
+#if CONFIG_DRIVERS_TRANSPONDER_UAVIONIX
+
+	uORB::Subscription _vehicle_gps_position_sub{ORB_ID(vehicle_gps_position)};
+	uORB::Subscription _vehicle_air_data_sub{ORB_ID(vehicle_air_data)};
+	uORB::Subscription _vehicle_status_sub{ORB_ID(vehicle_status)};
+
+	// Required update for cfg (static) msg is 0.1 [Hz] ->  5 [Hz] / 0.1 [Hz] = 50
+	uint8_t _period_counter = CFG_RESET_COUNTER;
+	static constexpr uint8_t CFG_PERIOD_COUNTER = 50;
+	static constexpr uint8_t CFG_RESET_COUNTER = 0;
+
+	DEFINE_PARAMETERS(
+		(ParamInt<px4::params::ADSB_SQUAWK>)		_adsb_squawk,
+		(ParamInt<px4::params::ADSB_ICAO_ID>)		_adsb_icao,
+		(ParamInt<px4::params::ADSB_LEN_WIDTH>)		_adsb_len_width,
+		(ParamInt<px4::params::ADSB_EMIT_TYPE>)		_adsb_emit_type,
+		(ParamInt<px4::params::ADSB_EMERGC>)		_adsb_emergc
+	);
+
+#endif
 
 	bool send() override
 	{
@@ -102,6 +127,89 @@ private:
 			mavlink_msg_adsb_vehicle_send_struct(_mavlink->get_channel(), &msg);
 			sent = true;
 		}
+
+#if CONFIG_DRIVERS_TRANSPONDER_UAVIONIX
+
+		if (_mavlink->get_mode() == Mavlink::MAVLINK_MODE_UAVIONIX) {
+
+			// Required update for dynamic message is 5 [Hz]
+			mavlink_uavionix_adsb_out_dynamic_t dynamic_msg = {
+				.utcTime = UINT32_MAX,
+				.gpsLat = INT32_MAX,
+				.gpsLon = INT32_MAX,
+				.gpsAlt = INT32_MAX,
+				.baroAltMSL = INT32_MAX,
+				.accuracyHor = UINT32_MAX,
+				.accuracyVert = UINT16_MAX,
+				.accuracyVel = UINT16_MAX,
+				.velVert = INT16_MAX,
+				.velNS = INT16_MAX,
+				.VelEW = INT16_MAX,
+				.state = UAVIONIX_ADSB_OUT_DYNAMIC_STATE_ON_GROUND,
+				.squawk = static_cast<uint16_t>(_adsb_squawk.get()),
+				.gpsFix = 0,
+				.numSats = UINT8_MAX,
+				.emergencyStatus = static_cast<uint8_t>(_adsb_emergc.get())
+			};
+
+			vehicle_status_s vehicle_status;
+
+			if (_vehicle_status_sub.update(&vehicle_status)) {
+				if (vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED) {
+					dynamic_msg.state |= ~UAVIONIX_ADSB_OUT_DYNAMIC_STATE_ON_GROUND;
+				}
+			}
+
+			sensor_gps_s vehicle_gps_position;
+
+			if (_vehicle_gps_position_sub.update(&vehicle_gps_position)) {
+
+				dynamic_msg.utcTime = static_cast<uint32_t>(vehicle_gps_position.time_utc_usec / 1000000ULL);
+				dynamic_msg.gpsLat = vehicle_gps_position.lat;
+				dynamic_msg.gpsLon = vehicle_gps_position.lon;
+				dynamic_msg.gpsAlt = vehicle_gps_position.alt;
+				dynamic_msg.gpsFix = vehicle_gps_position.fix_type;
+				dynamic_msg.numSats = vehicle_gps_position.satellites_used;
+				dynamic_msg.accuracyHor = static_cast<uint32_t>(vehicle_gps_position.eph * 1000.0f); // convert [m] to [mm]
+				dynamic_msg.accuracyVert = static_cast<uint16_t>(vehicle_gps_position.epv * 100.0f); // convert [m] to [cm]
+				//_dynamic_data.accuracyVel //TODO: anything to set here?
+				dynamic_msg.velVert = static_cast<int16_t>(vehicle_gps_position.vel_d_m_s * 100.0f); // convert [m/s] to [cm/s]
+				dynamic_msg.velNS = static_cast<int16_t>(vehicle_gps_position.vel_n_m_s * 100.0f); // convert [m/s] to [cm/s]
+				dynamic_msg.VelEW = static_cast<int16_t>(vehicle_gps_position.vel_e_m_s * 100.0f); // convert [m/s] to [cm/s]
+			}
+
+			vehicle_air_data_s vehicle_air_data;
+
+			if (_vehicle_air_data_sub.update(&vehicle_air_data)) {
+				dynamic_msg.baroAltMSL = static_cast<int32_t>(vehicle_air_data.baro_pressure_pa / 100.0f); // convert [Pa] to [mBar]
+			}
+
+			mavlink_msg_uavionix_adsb_out_dynamic_send_struct(_mavlink->get_channel(), &dynamic_msg);
+
+			_period_counter++;
+
+			if (_period_counter >= CFG_PERIOD_COUNTER) {
+
+				// Required update for static message is 0.1 [Hz]
+				mavlink_uavionix_adsb_out_cfg_t cfg_msg = {
+					.ICAO = static_cast<uint32_t>(_adsb_icao.get()),
+					.stallSpeed = 0, //TODO: any existing param?
+					//memcpy(cfg_msg.callsign, "PX4 UAV ", sizeof(cfg_msg.callsign)); TODO: shall to be changeable
+					.emitterType = static_cast<uint8_t>(_adsb_emit_type.get()),
+					.aircraftSize = static_cast<uint8_t>(_adsb_len_width.get()),
+					.gpsOffsetLat = 0x0, //TODO: add missing param
+					.gpsOffsetLon = 0x0, //TODO: add missing param
+					.rfSelect = UAVIONIX_ADSB_OUT_RF_SELECT_TX_ENABLED //TODO: add enum as param
+				};
+
+				mavlink_msg_uavionix_adsb_out_cfg_send_struct(_mavlink->get_channel(), &cfg_msg);
+				_period_counter = CFG_RESET_COUNTER;
+			}
+
+			sent = true;
+		}
+
+#endif
 
 		return sent;
 	}
